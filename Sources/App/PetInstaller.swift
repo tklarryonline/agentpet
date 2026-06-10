@@ -3,6 +3,10 @@ import AgentPetCore
 
 enum PetdexError: Error { case badStatus(Int) }
 
+/// A pet pack carried an unsafe slug or `spritesheetPath` (one that could
+/// traverse out of the pets directory), so the install was refused.
+enum PetInstallError: Error { case unsafePath }
+
 /// Petdex's asset CDN added hotlink protection: requests without a Referer from
 /// its own site get 403, which broke all pet downloads. We're a documented
 /// Petdex interop client, so we send the expected Referer.
@@ -46,19 +50,26 @@ enum PetInstaller {
     @discardableResult
     static func download(slug: String, petJsonURL: URL, spritesheetURL: URL, report: Bool = true) async throws -> String {
         let fm = FileManager.default
+        // `slug` and the pet.json `spritesheetPath` come straight from an
+        // untrusted remote manifest/pack. Both must be a single safe filename
+        // component, or a malicious pack could escape ~/.agentpet/pets/ via
+        // "../" and write attacker-controlled bytes to an arbitrary path (e.g. a
+        // LaunchAgent or a shell rc), which is a route to code execution.
+        guard let safeSlug = safePathComponent(slug) else { throw PetInstallError.unsafePath }
         let dir = URL(fileURLWithPath: AgentPetPaths.baseDir)
-            .appendingPathComponent("pets").appendingPathComponent(slug)
+            .appendingPathComponent("pets").appendingPathComponent(safeSlug)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
 
         let petJsonData = try await PetdexAssets.data(petJsonURL)
         let meta = try JSONDecoder().decode(PackMeta.self, from: petJsonData)
+        guard let safeSheetPath = safePathComponent(meta.spritesheetPath) else { throw PetInstallError.unsafePath }
         try petJsonData.write(to: dir.appendingPathComponent("pet.json"))
 
         let sheetData = try await PetdexAssets.data(spritesheetURL)
-        try sheetData.write(to: dir.appendingPathComponent(meta.spritesheetPath))
+        try sheetData.write(to: dir.appendingPathComponent(safeSheetPath))
 
-        if report { reportInstall(slug: slug) }
-        return meta.id ?? slug
+        if report { reportInstall(slug: safeSlug) }
+        return meta.id ?? safeSlug
     }
 
     /// Best-effort install ping so the community site can show real install counts.
@@ -138,6 +149,21 @@ enum PetInstaller {
             index += 1
         }
         return candidate
+    }
+
+    /// Validates an untrusted path fragment (a remote slug or a pet.json
+    /// `spritesheetPath`) is a single safe filename component. Returns it
+    /// unchanged when safe, or `nil` when it could traverse out of the pets
+    /// directory, so the caller refuses the whole install. Rejecting (rather
+    /// than rewriting) keeps the on-disk filename consistent with what pet.json
+    /// declares, so a legitimate pack (e.g. "spritesheet.png") still loads.
+    static func safePathComponent(_ value: String) -> String? {
+        guard !value.isEmpty,
+              !value.hasPrefix("~"),
+              !value.contains("/"),
+              !value.contains("\\"),
+              !value.contains("..") else { return nil }
+        return value
     }
 
     private static func safeFolderName(_ value: String) -> String {
